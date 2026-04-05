@@ -6,9 +6,13 @@ const std = @import("std");
 const httpz = @import("httpz.zig");
 
 const posix = std.posix;
+const sys = posix.system;
 const Allocator = std.mem.Allocator;
 
-const Conn = @import("worker.zig").HTTPConn;
+const worker = @import("worker.zig");
+const Conn = worker.HTTPConn;
+const Stream = worker.Stream;
+const Address = @import("config.zig").Address;
 const BufferPool = @import("buffer.zig").Pool;
 
 pub fn expectEqual(expected: anytype, actual: anytype) !void {
@@ -27,16 +31,16 @@ pub fn reset() void {
 
 pub fn getRandom() std.Random.DefaultPrng {
     var seed: u64 = undefined;
-    posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+    std.crypto.random.bytes(std.mem.asBytes(&seed));
     return std.Random.DefaultPrng.init(seed);
 }
 
 pub const Context = struct {
     // the stream that the server gets
-    stream: std.net.Stream,
+    stream: Stream,
 
     // the client (e.g. browser stream)
-    client: std.net.Stream,
+    client: Stream,
 
     closed: bool = false,
 
@@ -80,8 +84,8 @@ pub const Context = struct {
             posix.setsockopt(pair[1], posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 20_000))) catch unreachable;
         }
 
-        const server = std.net.Stream{ .handle = pair[0] };
-        const client = std.net.Stream{ .handle = pair[1] };
+        const server = Stream{ .handle = pair[0] };
+        const client = Stream{ .handle = pair[1] };
 
         var ctx_arena = ctx_allocator.create(std.heap.ArenaAllocator) catch unreachable;
         ctx_arena.* = std.heap.ArenaAllocator.init(ctx_allocator);
@@ -112,7 +116,7 @@ pub const Context = struct {
             ._state = .request,
             .handover = .close,
             .stream = server,
-            .address = std.net.Address.initIp4([_]u8{ 127, 0, 0, 200 }, 0),
+            .address = Address.initIp4([_]u8{ 127, 0, 0, 200 }, 0),
             .req_state = req_state,
             .res_state = res_state,
             .timeout = 0,
@@ -144,26 +148,26 @@ pub const Context = struct {
         ctx_allocator.destroy(self.arena);
     }
 
-    fn setupFakeSocketPair(server: *posix.socket_t, client: *posix.socket_t) !void {
-        const listener = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
-        defer posix.close(listener);
+    fn setupFakeSocketPair(server_fd: *posix.socket_t, client_fd: *posix.socket_t) !void {
+        const listener = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer sysClose(listener);
 
-        var address = try std.net.Address.parseIp("127.0.0.1", 0);
+        var address = try Address.parseIp("127.0.0.1", 0);
         try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try posix.bind(listener, &address.any, address.getOsSockLen());
-        try posix.listen(listener, 0);
+        try sysBind(listener, &address.any, address.getOsSockLen());
+        try sysListen(listener, 0);
 
-        var len: posix.socklen_t = @sizeOf(std.net.Address);
-        try posix.getsockname(listener, &address.any, &len);
+        var len: posix.socklen_t = @sizeOf(Address);
+        try sysGetsockname(listener, &address.any, &len);
 
         var thread = try std.Thread.spawn(.{}, struct {
-            fn accept(l: posix.socket_t, server_side: *posix.socket_t) !void {
-                server_side.* = try posix.accept(l, null, null, 0);
+            fn doAccept(l: posix.socket_t, server_side: *posix.socket_t) !void {
+                server_side.* = try sysAccept(l, null, null, 0);
             }
-        }.accept, .{ listener, server });
+        }.doAccept, .{ listener, server_fd });
 
-        client.* = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
-        try posix.connect(client.*, &address.any, address.getOsSockLen());
+        client_fd.* = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        try sysConnect(client_fd.*, &address.any, address.getOsSockLen());
         thread.join();
     }
 
@@ -256,7 +260,7 @@ pub const Context = struct {
     fn random(self: *Context) std.Random {
         if (self._random == null) {
             var seed: u64 = undefined;
-            posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+            std.crypto.random.bytes(std.mem.asBytes(&seed));
             self._random = std.Random.DefaultPrng.init(seed);
         }
         return self._random.?.random();
@@ -341,6 +345,66 @@ pub const Context = struct {
         }
     };
 };
+
+// Syscall wrappers for removed posix functions
+fn sysSocket(domain: u32, socket_type: u32, protocol: u32) !posix.socket_t {
+    const builtin_mod = @import("builtin");
+    const native_os = builtin_mod.os.tag;
+    const is_darwin = switch (native_os) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => true,
+        else => false,
+    };
+
+    const sock_cloexec: u32 = posix.SOCK.CLOEXEC;
+    const sock_nonblock: u32 = posix.SOCK.NONBLOCK;
+    const raw_type = if (is_darwin) socket_type & ~sock_cloexec & ~sock_nonblock else socket_type;
+
+    const rc = sys.socket(domain, raw_type, protocol);
+    if (rc < 0) return error.Unexpected;
+    const fd: posix.socket_t = @intCast(rc);
+
+    if (is_darwin) {
+        if (socket_type & sock_cloexec != 0) {
+            _ = sys.fcntl(fd, std.posix.F.SETFD, @as(u32, std.posix.FD_CLOEXEC));
+        }
+        if (socket_type & sock_nonblock != 0) {
+            _ = sys.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+        }
+    }
+
+    return fd;
+}
+
+fn sysClose(fd: posix.fd_t) void {
+    _ = sys.close(fd);
+}
+
+fn sysBind(sock: posix.socket_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+    const rc = sys.bind(sock, addr, addrlen);
+    if (rc != 0) return error.Unexpected;
+}
+
+fn sysListen(sock: posix.socket_t, backlog: u32) !void {
+    const rc = sys.listen(sock, @intCast(backlog));
+    if (rc != 0) return error.Unexpected;
+}
+
+fn sysGetsockname(fd: posix.socket_t, addr: *posix.sockaddr, addrlen: *posix.socklen_t) !void {
+    const rc = sys.getsockname(fd, addr, addrlen);
+    if (rc != 0) return error.Unexpected;
+}
+
+fn sysAccept(sock: posix.socket_t, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t, flags: u32) !posix.socket_t {
+    _ = flags;
+    const rc = sys.accept(sock, addr, addrlen);
+    if (rc < 0) return error.Unexpected;
+    return @intCast(rc);
+}
+
+fn sysConnect(sock: posix.socket_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+    const rc = sys.connect(sock, addr, addrlen);
+    if (rc != 0) return error.Unexpected;
+}
 
 pub fn randomString(random: std.Random, a: Allocator, max: usize) []u8 {
     var buf = a.alloc(u8, random.uintAtMost(usize, max) + 1) catch unreachable;

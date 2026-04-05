@@ -14,7 +14,7 @@ const StringKeyValue = @import("key_value.zig").StringKeyValue;
 const MultiFormKeyValue = @import("key_value.zig").MultiFormKeyValue;
 const Config = @import("config.zig").Config.Request;
 
-const Address = std.net.Address;
+const Address = @import("config.zig").Address;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 

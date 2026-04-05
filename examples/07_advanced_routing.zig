@@ -10,7 +10,7 @@ const PORT = 8807;
 // per-route configuration for middleware specifically).
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     var default_handler = Handler{
@@ -58,7 +58,9 @@ const Handler = struct {
     pub fn dispatch(h: *Handler, action: httpz.Action(*Handler), req: *httpz.Request, res: *httpz.Response) !void {
         try action(h, req, res);
         if (h.log) {
-            std.debug.print("ts={d} path={s} status={d}\n", .{ std.time.timestamp(), req.url.path, res.status });
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &ts);
+            std.debug.print("ts={d} path={s} status={d}\n", .{ ts.sec, req.url.path, res.status });
         }
     }
 };

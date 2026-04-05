@@ -17,8 +17,8 @@ pub const Url = @import("url.zig").Url;
 pub const Config = @import("config.zig").Config;
 
 const Thread = std.Thread;
-const net = std.net;
 const posix = std.posix;
+const sys = posix.system;
 const Allocator = std.mem.Allocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 
@@ -31,6 +31,75 @@ const build = @import("build");
 const force_blocking: bool = if (@hasDecl(build, "httpz_blocking")) build.httpz_blocking else false;
 
 const MAX_REQUEST_COUNT = std.math.maxInt(usize);
+
+// Sync primitives (replacements for removed Mutex/Condition/Semaphore)
+pub const Mutex = struct {
+    impl: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    pub fn lock(self: *Mutex) void {
+        const rc = std.c.pthread_mutex_lock(&self.impl);
+        std.debug.assert(rc == .SUCCESS);
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        const rc = std.c.pthread_mutex_unlock(&self.impl);
+        std.debug.assert(rc == .SUCCESS);
+    }
+};
+
+pub const Condition = struct {
+    impl: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        const rc = std.c.pthread_cond_wait(&self.impl, &mutex.impl);
+        std.debug.assert(rc == .SUCCESS);
+    }
+
+    pub fn signal(self: *Condition) void {
+        const rc = std.c.pthread_cond_signal(&self.impl);
+        std.debug.assert(rc == .SUCCESS);
+    }
+
+    pub fn broadcast(self: *Condition) void {
+        const rc = std.c.pthread_cond_broadcast(&self.impl);
+        std.debug.assert(rc == .SUCCESS);
+    }
+};
+
+pub const Semaphore = struct {
+    count: u32 = 0,
+    mutex: Mutex = .{},
+    cond: Condition = .{},
+
+    pub fn wait(self: *Semaphore) void {
+        self.mutex.lock();
+        while (self.count == 0) {
+            self.cond.wait(&self.mutex);
+        }
+        self.count -= 1;
+        self.mutex.unlock();
+    }
+
+    pub fn post(self: *Semaphore) void {
+        self.mutex.lock();
+        self.count += 1;
+        self.mutex.unlock();
+        self.cond.signal();
+    }
+};
+
+pub fn sleep(ns: u64) void {
+    var req = posix.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (true) {
+        var rem: posix.timespec = undefined;
+        const rc = sys.nanosleep(&req, &rem);
+        if (rc == 0) return;
+        req = rem;
+    }
+}
 
 pub fn writeMetrics(writer: *std.Io.Writer) !void {
     return @import("metrics.zig").write(writer);
@@ -257,9 +326,9 @@ pub fn Server(comptime H: type) type {
         arena: Allocator,
         allocator: Allocator,
         _router: Router(H, ActionArg),
-        _mut: Thread.Mutex,
+        _mut: Mutex,
         _workers: []Worker,
-        _cond: Thread.Condition,
+        _cond: Condition,
         _listener: ?posix.socket_t,
         _max_request_per_connection: usize,
         _middlewares: []const Middleware(H),
@@ -356,7 +425,7 @@ pub fn Server(comptime H: type) type {
                 if (blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
 
                 const proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
-                break :blk try posix.socket(address.any.family, sock_flags, proto);
+                break :blk try sysSocket(address.any.family, sock_flags, proto);
             };
 
             if (no_delay) {
@@ -380,8 +449,8 @@ pub fn Server(comptime H: type) type {
 
             {
                 const socklen = address.getOsSockLen();
-                try posix.bind(listener, &address.any, socklen);
-                try posix.listen(listener, 1024); // kernel backlog
+                try sysBind(listener, &address.any, socklen);
+                try sysListen(listener, 1024); // kernel backlog
             }
 
             self._listener = listener;
@@ -412,7 +481,7 @@ pub fn Server(comptime H: type) type {
                     workers[i].stop();
                 };
 
-                var ready_sem = std.Thread.Semaphore{};
+                var ready_sem = Semaphore{};
                 const threads = try self.arena.alloc(Thread, workers.len);
                 for (0..workers.len) |i| {
                     workers[i] = try Worker.init(allocator, self, &config);
@@ -467,9 +536,9 @@ pub fn Server(comptime H: type) type {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
-                    posix.shutdown(l, .recv) catch {};
+                    sysShutdown(l, 0) catch {};
                 }
-                posix.close(l);
+                sysClose(l);
             }
         }
 
@@ -673,7 +742,7 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
     const http_conn = res.conn;
     const ws_worker: *websocket.server.Worker(H) = @ptrCast(@alignCast(http_conn.ws_worker));
 
-    var hc = try ws_worker.createConn(http_conn.stream.handle, http_conn.address, worker.timestamp(0));
+    var hc = try ws_worker.createConn(http_conn.stream.handle, @bitCast(http_conn.address), worker.timestamp(0));
     errdefer ws_worker.cleanupConn(hc);
 
     hc.handler = try H.init(&hc.conn, ctx);
@@ -771,7 +840,7 @@ fn drain(req: *Request) !void {
 }
 
 const t = @import("t.zig");
-var global_test_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+var global_test_allocator = std.heap.DebugAllocator(.{}){};
 
 var test_handler_dispatch = TestHandlerDispatch{ .state = 10 };
 var test_handler_disaptch_context = TestHandlerDispatchContext{ .state = 20 };
@@ -1719,7 +1788,7 @@ test "httpz: request in chunks" {
     const w = &writer.interface;
     try w.writeAll("GET /api/v2/use");
     try w.flush();
-    std.Thread.sleep(std.time.ns_per_ms * 10);
+    sleep(std.time.ns_per_ms * 10);
     try w.writeAll("rs/11 HTTP/1.1\r\n\r\n");
     try w.flush();
 
@@ -1856,7 +1925,7 @@ test "httpz: request body reader" {
         while (req.len > 0) {
             const len = random.uintAtMost(usize, req.len - 1) + 1;
             try w.writeAll(req[0..len]);
-            std.Thread.sleep(std.time.ns_per_ms * 2);
+            sleep(std.time.ns_per_ms * 2);
             req = req[len..];
         }
 
@@ -1904,7 +1973,7 @@ test "websocket: upgrade" {
 
     // https://github.com/karlseguin/http.zig/pull/188
     try w.flush();
-    std.Thread.sleep(std.time.ns_per_ms * 5);
+    sleep(std.time.ns_per_ms * 5);
 
     try w.writeAll(&websocket.frameText("close"));
     try w.flush();
@@ -1925,7 +1994,7 @@ test "websocket: upgrade" {
                                     break;
                                 }
                                 wait_count += 1;
-                                std.Thread.sleep(std.time.ns_per_ms);
+                                sleep(std.time.ns_per_ms);
                                 continue;
                             },
                             else => {},
@@ -2034,20 +2103,73 @@ test "ContentType: forX" {
     try t.expectEqual(ContentType.UNKNOWN, ContentType.forFile("must.spice"));
 }
 
-fn testStream(port: u16) std.net.Stream {
+// Syscall wrappers for removed posix functions
+fn sysSocket(domain: u32, socket_type: u32, protocol: u32) !posix.socket_t {
+    const native_os = builtin.os.tag;
+    const is_darwin = switch (native_os) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => true,
+        else => false,
+    };
+
+    // Darwin doesn't support SOCK_CLOEXEC/SOCK_NONBLOCK in the socket() syscall.
+    // Zig defines shim values for them, so we must strip them and apply via fcntl.
+    const sock_cloexec: u32 = posix.SOCK.CLOEXEC;
+    const sock_nonblock: u32 = posix.SOCK.NONBLOCK;
+    const raw_type = if (is_darwin) socket_type & ~sock_cloexec & ~sock_nonblock else socket_type;
+
+    const rc = sys.socket(domain, raw_type, protocol);
+    if (rc < 0) return error.Unexpected;
+    const fd: posix.socket_t = @intCast(rc);
+
+    if (is_darwin) {
+        if (socket_type & sock_cloexec != 0) {
+            _ = sys.fcntl(fd, std.posix.F.SETFD, @as(u32, std.posix.FD_CLOEXEC));
+        }
+        if (socket_type & sock_nonblock != 0) {
+            _ = sys.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+        }
+    }
+
+    return fd;
+}
+
+fn sysBind(sock: posix.socket_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+    const rc = sys.bind(sock, addr, addrlen);
+    if (rc != 0) return error.Unexpected;
+}
+
+fn sysListen(sock: posix.socket_t, backlog: u32) !void {
+    const rc = sys.listen(sock, @intCast(backlog));
+    if (rc != 0) return error.Unexpected;
+}
+
+fn sysClose(fd: posix.fd_t) void {
+    _ = sys.close(fd);
+}
+
+fn sysShutdown(sock: posix.socket_t, how: c_int) !void {
+    const rc = sys.shutdown(sock, how);
+    if (rc != 0) return error.Unexpected;
+}
+
+const Address = @import("config.zig").Address;
+const Stream = worker.Stream;
+const StreamReader = worker.StreamReader;
+
+fn testStream(port: u16) Stream {
     const timeout = std.mem.toBytes(posix.timeval{
         .sec = 0,
         .usec = 20_000,
     });
 
-    const address = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
-    const stream = std.net.tcpConnectToAddress(address) catch unreachable;
+    const address = Address.parseIp("127.0.0.1", port) catch unreachable;
+    const stream = testing.tcpConnectToAddress(address) catch unreachable;
     posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout) catch unreachable;
     posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch unreachable;
     return stream;
 }
 
-fn testReadAll(stream: std.net.Stream, buf: []u8) []u8 {
+fn testReadAll(stream: Stream, buf: []u8) []u8 {
     var pos: usize = 0;
     var blocked = false;
     var reader = stream.reader(&.{});
@@ -2063,7 +2185,7 @@ fn testReadAll(stream: std.net.Stream, buf: []u8) []u8 {
                             error.WouldBlock => {
                                 if (blocked) return buf[0..pos];
                                 blocked = true;
-                                std.Thread.sleep(std.time.ns_per_ms);
+                                sleep(std.time.ns_per_ms);
                                 continue;
                             },
                             error.ConnectionResetByPeer => return buf[0..pos],
@@ -2084,13 +2206,13 @@ fn testReadAll(stream: std.net.Stream, buf: []u8) []u8 {
     unreachable;
 }
 
-fn testReadParsed(stream: std.net.Stream) testing.Testing.Response {
+fn testReadParsed(stream: Stream) testing.Testing.Response {
     var buf: [4096]u8 = undefined;
     const data = testReadAll(stream, &buf);
     return testing.parse(data) catch unreachable;
 }
 
-fn testReadHeader(stream: std.net.Stream) testing.Testing.Response {
+fn testReadHeader(stream: Stream) testing.Testing.Response {
     var pos: usize = 0;
     var blocked = false;
     var buf: [1024]u8 = undefined;
@@ -2107,7 +2229,7 @@ fn testReadHeader(stream: std.net.Stream) testing.Testing.Response {
                             error.WouldBlock => {
                                 if (blocked) unreachable;
                                 blocked = true;
-                                std.Thread.sleep(std.time.ns_per_ms);
+                                sleep(std.time.ns_per_ms);
                                 continue;
                             },
                             else => @panic(@errorName(e)),
@@ -2206,7 +2328,7 @@ const TestDummyHandler = struct {
     const StreamContext = struct {
         data: []const u8,
 
-        fn handle(self: StreamContext, stream: std.net.Stream) void {
+        fn handle(self: StreamContext, stream: Stream) void {
             var writer = stream.writer(&.{});
             const w = &writer.interface;
             w.writeAll(self.data) catch unreachable;

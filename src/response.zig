@@ -9,7 +9,7 @@ const Config = @import("config.zig").Config.Response;
 const StringKeyValue = @import("key_value.zig").StringKeyValue;
 
 const mem = std.mem;
-const Stream = std.net.Stream;
+const Stream = @import("worker.zig").Stream;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Writer = std.Io.Writer;
@@ -112,7 +112,7 @@ pub const Response = struct {
         self.headers.add(n, v);
     }
 
-    pub fn startEventStream(self: *Response, ctx: anytype, comptime handler: fn (@TypeOf(ctx), std.net.Stream) void) !void {
+    pub fn startEventStream(self: *Response, ctx: anytype, comptime handler: fn (@TypeOf(ctx), Stream) void) !void {
         self.content_type = .EVENTS;
         self.headers.add("Cache-Control", "no-cache");
         self.headers.add("Connection", "keep-alive");
@@ -129,7 +129,7 @@ pub const Response = struct {
         thread.detach();
     }
 
-    pub fn startEventStreamSync(self: *Response) !std.net.Stream {
+    pub fn startEventStreamSync(self: *Response) !Stream {
         self.content_type = .EVENTS;
         self.headers.add("Cache-Control", "no-cache");
         self.headers.add("Connection", "keep-alive");

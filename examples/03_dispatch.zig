@@ -8,7 +8,7 @@ const PORT = 8803;
 // in how actions are executed.
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     var handler = Handler{};
@@ -37,12 +37,20 @@ const Handler = struct {
         // httpz supports middlewares, but in many cases, having a dispatch is good
         // enough and is much more straightforward.
 
-        var start = try std.time.Timer.start();
+        var start_ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &start_ts);
+
         // We don't _have_ to call the action if we don't want to. For example
         // we could do authentication and set the response directly on error.
         try action(self, req, res);
 
-        std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+        var end_ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &end_ts);
+        const elapsed_us = (@as(i64, end_ts.sec) - @as(i64, start_ts.sec)) * 1_000_000 + @divTrunc(@as(i64, end_ts.nsec) - @as(i64, start_ts.nsec), 1000);
+
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &ts);
+        std.debug.print("ts={d} us={d} path={s}\n", .{ ts.sec, elapsed_us, req.url.path });
     }
 };
 

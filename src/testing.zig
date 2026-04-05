@@ -4,7 +4,12 @@ const std = @import("std");
 const t = @import("t.zig");
 const httpz = @import("httpz.zig");
 
-const Conn = @import("worker.zig").HTTPConn;
+const posix = std.posix;
+const sys = posix.system;
+const worker = @import("worker.zig");
+const Conn = worker.HTTPConn;
+const Stream = worker.Stream;
+const Address = @import("config.zig").Address;
 
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
@@ -290,17 +295,37 @@ pub fn parseWithAllocator(allocator: Allocator, data: []u8) !Testing.Response {
 /// Waits until a TCP port is accepting connections (e.g. after starting a server in another thread).
 /// Tries up to 100 times with 20ms sleep between attempts.
 pub fn waitForPort(port: u16) !void {
-    const address = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
+    const address = Address.parseIp("127.0.0.1", port) catch unreachable;
     for (0..100) |_| {
-        if (std.net.tcpConnectToAddress(address)) |stream| {
+        if (tcpConnectToAddress(address)) |stream| {
             stream.close();
             return;
         } else |err| {
             if (err != error.ConnectionRefused) return err;
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+            httpz.sleep(20 * std.time.ns_per_ms);
         }
     }
     return error.ConnectionRefused;
+}
+
+fn tcpConnectToAddress(address: Address) !Stream {
+    const sock_flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const proto: u32 = if (address.any.family == posix.AF.INET or address.any.family == posix.AF.INET6)
+        posix.IPPROTO.TCP
+    else
+        0;
+    const rc = sys.socket(address.any.family, sock_flags, proto);
+    if (rc < 0) return error.SocketCreateFailed;
+    const fd: posix.socket_t = @intCast(rc);
+    errdefer _ = sys.close(fd);
+    const conn_rc = sys.connect(fd, &address.any, address.getOsSockLen());
+    if (conn_rc != 0) {
+        return switch (std.c.errno(conn_rc)) {
+            .CONNREFUSED => error.ConnectionRefused,
+            else => error.Unexpected,
+        };
+    }
+    return .{ .handle = fd };
 }
 
 fn decodeChunkedEncoding(full_dest: []u8, full_src: []u8) usize {

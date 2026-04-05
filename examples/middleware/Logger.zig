@@ -34,10 +34,15 @@ pub fn execute(self: *const Logger, req: *httpz.Request, res: *httpz.Response, e
     // Better to use an std.time.Timer to measure elapsed time
     // but we need the "start" time for our log anyways, so while this might occasionally
     // report wrong/strange "elapsed" time, it's simpler to do.
-    const start = std.time.microTimestamp();
+    var start_ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &start_ts);
+    const start = @as(i64, start_ts.sec) * 1_000_000 + @divTrunc(@as(i64, start_ts.nsec), 1000);
 
     defer {
-        const elapsed = std.time.microTimestamp() - start;
+        var end_ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &end_ts);
+        const end = @as(i64, end_ts.sec) * 1_000_000 + @divTrunc(@as(i64, end_ts.nsec), 1000);
+        const elapsed = end - start;
         std.log.info("{d}\t{s}?{s}\t{d}\t{d}us", .{start, req.url.path, if (self.query) req.url.query else "", res.status, elapsed});
     }
 

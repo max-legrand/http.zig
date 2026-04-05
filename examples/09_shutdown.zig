@@ -15,7 +15,7 @@ pub fn main() !void {
         return error.PlatformNotSupported;
     }
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     // call our shutdown function (below) when
@@ -44,7 +44,7 @@ pub fn main() !void {
     try server.listen();
 }
 
-fn shutdown(_: c_int) callconv(.c) void {
+fn shutdown(_: std.posix.SIG) callconv(.c) void {
     if (server_instance) |server| {
         server_instance = null;
         server.stop();

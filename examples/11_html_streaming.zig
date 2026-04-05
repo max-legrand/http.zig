@@ -6,7 +6,7 @@ const PORT = 8801;
 
 /// This example demonstrates HTML streaming.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     var server = try httpz.Server(void).init(allocator, .{
@@ -45,10 +45,10 @@ fn index(_: *httpz.Request, res: *httpz.Response) !void {
         \\  </body>
         \\</html>
     );
-    std.Thread.sleep(wait_time);
+    httpz.sleep(wait_time);
     try res.chunk("\n<span slot='item-2'>Item 2</span>");
-    std.Thread.sleep(wait_time);
+    httpz.sleep(wait_time);
     try res.chunk("\n<span slot='item-0'>Item 0</span>");
-    std.Thread.sleep(wait_time);
+    httpz.sleep(wait_time);
     try res.chunk("\n<span slot='item-1'>Item 1</span>");
 }

@@ -3,7 +3,7 @@ const metrics = @import("metrics.zig");
 
 const blockingMode = @import("httpz.zig").blockingMode;
 
-const Mutex = std.Thread.Mutex;
+const Mutex = @import("httpz.zig").Mutex;
 const Allocator = std.mem.Allocator;
 
 pub const Buffer = struct {

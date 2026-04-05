@@ -3,7 +3,83 @@ const httpz = @import("httpz.zig");
 const request = @import("request.zig");
 const response = @import("response.zig");
 
-const Address = std.net.Address;
+const posix = std.posix;
+
+pub const Address = extern union {
+    any: posix.sockaddr,
+    in: posix.sockaddr.in,
+    in6: posix.sockaddr.in6,
+    un: posix.sockaddr.un,
+
+    pub fn initIp4(addr: [4]u8, port: u16) Address {
+        return .{ .in = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast(addr),
+        } };
+    }
+
+    pub fn initIp6(addr: [16]u8, port: u16) Address {
+        return .{ .in6 = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .flowinfo = 0,
+            .addr = addr,
+            .scope_id = 0,
+        } };
+    }
+
+    pub fn parseIp(text: []const u8, port: u16) !Address {
+        return parseIp4(text, port) catch parseIp6(text, port);
+    }
+
+    fn parseIp4(text: []const u8, port: u16) !Address {
+        var addr: [4]u8 = undefined;
+        var octet: u16 = 0;
+        var octet_count: u8 = 0;
+        var saw_digit = false;
+        for (text) |c| {
+            if (c == '.') {
+                if (!saw_digit or octet_count >= 3) return error.InvalidAddress;
+                addr[octet_count] = @intCast(octet);
+                octet_count += 1;
+                octet = 0;
+                saw_digit = false;
+            } else if (c >= '0' and c <= '9') {
+                octet = octet * 10 + (c - '0');
+                if (octet > 255) return error.InvalidAddress;
+                saw_digit = true;
+            } else {
+                return error.InvalidAddress;
+            }
+        }
+        if (!saw_digit or octet_count != 3) return error.InvalidAddress;
+        addr[3] = @intCast(octet);
+        return initIp4(addr, port);
+    }
+
+    fn parseIp6(_: []const u8, _: u16) !Address {
+        return error.InvalidAddress;
+    }
+
+    pub fn initUnix(path: []const u8) !Address {
+        var addr: Address = .{ .un = undefined };
+        addr.un.family = posix.AF.UNIX;
+        if (path.len >= addr.un.path.len) return error.NameTooLong;
+        @memcpy(addr.un.path[0..path.len], path);
+        if (path.len < addr.un.path.len) {
+            addr.un.path[path.len] = 0;
+        }
+        return addr;
+    }
+
+    pub fn getOsSockLen(self: Address) posix.socklen_t {
+        return switch (self.any.family) {
+            posix.AF.INET => @sizeOf(posix.sockaddr.in),
+            posix.AF.INET6 => @sizeOf(posix.sockaddr.in6),
+            posix.AF.UNIX => @sizeOf(posix.sockaddr.un),
+            else => @sizeOf(posix.sockaddr.storage),
+        };
+    }
+};
 
 pub const Config = struct {
     address: AddressConfig = .localhost(5882),
@@ -84,10 +160,16 @@ pub const Config = struct {
         return switch (self.address) {
             .ip => |i| try .parseIp(i.host, i.port),
             .unix => |unix_path| b: {
-                if (comptime std.net.has_unix_sockets == false) {
+                if (comptime std.Io.net.has_unix_sockets == false) {
                     break :b error.UnixPathNotSupported;
                 }
-                std.fs.deleteFileAbsolute(unix_path) catch {};
+                // Best-effort cleanup of existing socket file
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (unix_path.len < path_buf.len) {
+                    @memcpy(path_buf[0..unix_path.len], unix_path);
+                    path_buf[unix_path.len] = 0;
+                    _ = posix.system.unlink(@ptrCast(path_buf[0..unix_path.len :0]));
+                }
                 break :b try .initUnix(unix_path);
             },
             .addr => |a| a,

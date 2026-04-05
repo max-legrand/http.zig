@@ -12,25 +12,144 @@ const Response = httpz.Response;
 const BufferPool = @import("buffer.zig").Pool;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 
-const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-const net = std.net;
-const Stream = net.Stream;
-const NetConn = net.StreamServer.Connection;
-
 const posix = std.posix;
+const sys = posix.system;
 const log = std.log.scoped(.httpz);
 
+const Address = @import("config.zig").Address;
+
 const MAX_TIMEOUT = 2_147_483_647;
+
+pub const Stream = struct {
+    handle: posix.socket_t,
+
+    pub fn close(self: Stream) void {
+        sysClose(self.handle);
+    }
+
+    pub fn reader(self: Stream, buffer: []u8) StreamReader {
+        return StreamReader.init(self.handle, buffer);
+    }
+
+    pub fn writer(self: Stream, buffer: []u8) StreamWriter {
+        return StreamWriter.init(self.handle, buffer);
+    }
+};
+
+pub const StreamReader = struct {
+    fd: posix.socket_t,
+    err: ?Error = null,
+    _reader: std.Io.Reader,
+
+    const Error = posix.ReadError;
+
+    const vtable: std.Io.Reader.VTable = .{
+        .stream = streamFn,
+    };
+
+    fn init(fd: posix.socket_t, buffer: []u8) StreamReader {
+        return .{
+            .fd = fd,
+            .err = null,
+            ._reader = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    pub fn interface(self: *StreamReader) *std.Io.Reader {
+        return &self._reader;
+    }
+
+    pub fn getError(self: *const StreamReader) ?Error {
+        return self.err;
+    }
+
+    fn streamFn(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *StreamReader = @alignCast(@fieldParentPtr("_reader", io_r));
+        const buf = limit.slice(try w.writableSliceGreedy(1));
+        const n = posix.read(self.fd, buf) catch |e| {
+            self.err = e;
+            return error.ReadFailed;
+        };
+        w.advance(n);
+        return n;
+    }
+};
+
+pub const StreamWriter = struct {
+    fd: posix.socket_t,
+    err: ?Error = null,
+    interface: std.Io.Writer,
+
+    const Error = error{
+        WouldBlock,
+        BrokenPipe,
+        ConnectionResetByPeer,
+        Unexpected,
+    };
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drainFn,
+    };
+
+    fn init(fd: posix.socket_t, buffer: []u8) StreamWriter {
+        return .{
+            .fd = fd,
+            .err = null,
+            .interface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *StreamWriter = @alignCast(@fieldParentPtr("interface", w));
+        _ = splat;
+
+        // First flush the buffer
+        if (w.end > 0) {
+            var buf = w.buffer[0..w.end];
+            while (buf.len > 0) {
+                const n = sysWrite(self.fd, buf) catch |e| {
+                    self.err = e;
+                    return error.WriteFailed;
+                };
+                buf = buf[n..];
+            }
+            w.end = 0;
+        }
+
+        // Then write each data slice
+        var total: usize = 0;
+        for (data) |slice| {
+            var remaining = slice;
+            while (remaining.len > 0) {
+                const n = sysWrite(self.fd, remaining) catch |e| {
+                    self.err = e;
+                    return error.WriteFailed;
+                };
+                remaining = remaining[n..];
+                total += n;
+            }
+        }
+        return total;
+    }
+};
 
 // This is our Blocking worker. It's very different than NonBlocking and much
 // simpler. (WSH is our websocket handler, and can be void)
 pub fn Blocking(comptime S: type, comptime WSH: type) type {
     return struct {
         server: S,
-        mut: Thread.Mutex,
+        mut: httpz.Mutex,
         config: *const Config,
         allocator: Allocator,
         buffer_pool: *BufferPool,
@@ -122,7 +241,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 .timeout_request = timeout_request,
                 .timeout_keepalive = timeout_keepalive,
                 .timeout_write_error = Timeout.init(5),
-                .conn_node_pool = std.heap.MemoryPool(ConnNode).init(allocator),
+                .conn_node_pool = std.heap.MemoryPool(ConnNode).empty,
                 .retain_allocated_bytes_keepalive = retain_allocated_bytes_keepalive,
             };
         }
@@ -135,7 +254,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             allocator.destroy(self.websocket);
 
             self.http_conn_pool.deinit();
-            self.conn_node_pool.deinit();
+            self.conn_node_pool.deinit(allocator);
 
             self.buffer_pool.deinit();
             allocator.destroy(self.buffer_pool);
@@ -144,9 +263,9 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         pub fn listen(self: *Self, listener: posix.socket_t) void {
             var thread_pool = &self.thread_pool;
             while (true) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
+                var address: Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(Address);
+                const socket = sysAccept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
                     if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                         self.websocket.shutdown();
                         break;
@@ -165,7 +284,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 var node = self.connections.head;
                 while (node) |n| {
                     node = n.next;
-                    posix.close(n.socket);
+                    sysClose(n.socket);
                 }
             }
             thread_pool.stop();
@@ -178,11 +297,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
         // Called in a worker thread. `thread_buf` is a thread-specific buffer that
         // we are free to use as needed.
-        pub fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, thread_buf: []u8) void {
+        pub fn handleConnection(self: *Self, socket: posix.socket_t, address: Address, thread_buf: []u8) void {
             const connection_node = blk: {
                 self.mut.lock();
                 defer self.mut.unlock();
-                const node = self.conn_node_pool.create() catch |err| {
+                const node = self.conn_node_pool.create(self.allocator) catch |err| {
                     log.err("Failed to initialize connection node: {}", .{err});
                     return;
                 };
@@ -219,7 +338,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                     },
                     .close, .unknown => {
-                        posix.close(socket);
+                        sysClose(socket);
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -293,7 +412,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         else => {},
                     }
                     requestError(conn, err) catch {};
-                    posix.close(stream.handle);
+                    sysClose(stream.handle);
                     return .disown;
                 };
 
@@ -460,8 +579,8 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             var buffer_pool = try initializeBufferPool(allocator, config);
             errdefer buffer_pool.deinit();
 
-            var conn_mem_pool = std.heap.MemoryPool(Conn(WSH)).init(allocator);
-            errdefer conn_mem_pool.deinit();
+            var conn_mem_pool = std.heap.MemoryPool(Conn(WSH)).empty;
+            errdefer conn_mem_pool.deinit(allocator);
 
             var http_conn_pool = try HTTPConnPool.init(allocator, buffer_pool, websocket, loop.fd, config);
             errdefer http_conn_pool.deinit();
@@ -514,7 +633,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             self.shutdownConcurrentList(&self.keepalive_list);
 
             self.buffer_pool.deinit();
-            self.conn_mem_pool.deinit();
+            self.conn_mem_pool.deinit(allocator);
             self.http_conn_pool.deinit();
             allocator.destroy(self.buffer_pool);
 
@@ -526,7 +645,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             self.loop.stop();
         }
 
-        pub fn run(self: *Self, listener: posix.fd_t, ready_sem: *std.Thread.Semaphore) void {
+        pub fn run(self: *Self, listener: posix.fd_t, ready_sem: *httpz.Semaphore) void {
             var thread_pool = &self.thread_pool;
 
             self.loop.start() catch |err| {
@@ -560,7 +679,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
                 var it = self.loop.wait(timeout) catch |err| {
                     log.err("Failed to wait on events: {}", .{err});
-                    std.Thread.sleep(std.time.ns_per_s);
+                    httpz.sleep(std.time.ns_per_s);
                     continue;
                 };
 
@@ -571,7 +690,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     switch (event) {
                         .accept => self.accept(listener, now) catch |err| {
                             log.err("Failed to accept connection: {}", .{err});
-                            std.Thread.sleep(std.time.ns_per_ms * 5);
+                            httpz.sleep(std.time.ns_per_ms * 5);
                         },
                         .signal => self.processSignal(&closed_conn),
                         .recv => |conn| switch (conn.protocol) {
@@ -678,10 +797,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     self.loop.pauseAccept(listener) catch {};
                     return;
                 }
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
+                var address: Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(Address);
 
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
+                const socket = sysAccept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
                     // On BSD, REUSEPORT_LB means that only 1 worker should get notified
                     // of a connetion. On Linux, however, we only have REUSEPORT, which will
                     // notify all workers. However, we monitor the listener using EPOLLEXCLUSIVE.
@@ -692,14 +811,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     // Linux can wake up multiple epoll fds for a single connection.
                     return if (err == error.WouldBlock) {} else err;
                 };
-                errdefer posix.close(socket);
+                errdefer sysClose(socket);
                 metrics.connection();
 
-                const socket_flags = try posix.fcntl(socket, posix.F.GETFL, 0);
+                const socket_flags = try sysFcntl(socket, posix.F.GETFL, 0);
                 const nonblocking = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
                 std.debug.assert(socket_flags & nonblocking == nonblocking);
 
-                const conn = try self.conn_mem_pool.create();
+                const conn = try self.conn_mem_pool.create(self.allocator);
                 errdefer self.conn_mem_pool.destroy(conn);
 
                 const http_conn = try self.http_conn_pool.acquire();
@@ -835,7 +954,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     // If we don't do this here, then you'd get a segfault if
                     // the signal cleared the connetion, and then in recv we'd
                     // try to call conn.getState() after the signal.
-                    posix.close(http_conn.stream.handle);
+                    sysClose(http_conn.stream.handle);
                 },
                 .websocket, .disown => {},
             }
@@ -950,7 +1069,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             while (conn) |c| {
                 conn = c.next;
                 const http_conn = c.protocol.http;
-                posix.close(http_conn.stream.handle);
+                sysClose(http_conn.stream.handle);
                 http_conn.deinit(allocator);
             }
         }
@@ -1010,7 +1129,7 @@ pub fn List(comptime T: type) type {
 pub fn ConcurrentList(comptime T: type) type {
     return struct {
         inner: List(T) = .{},
-        mut: Thread.Mutex = .{},
+        mut: httpz.Mutex = .{},
 
         const Self = @This();
 
@@ -1040,7 +1159,7 @@ fn KQueue(comptime WSH: type) type {
 
         fn init() !Self {
             return .{
-                .fd = try posix.kqueue(),
+                .fd = try sysKqueue(),
                 .change_count = 0,
                 .change_buffer = undefined,
                 .event_list = undefined,
@@ -1048,7 +1167,7 @@ fn KQueue(comptime WSH: type) type {
         }
 
         fn deinit(self: *const Self) void {
-            posix.close(self.fd);
+            sysClose(self.fd);
         }
 
         fn start(self: *Self) !void {
@@ -1058,7 +1177,7 @@ fn KQueue(comptime WSH: type) type {
 
         fn stop(self: *Self) void {
             // called from an arbitrary thread, can't use change
-            _ = posix.kevent(self.fd, &.{
+            _ = sysKevent(self.fd, &.{
                 .{
                     .ident = 2,
                     .filter = posix.system.EVFILT.USER,
@@ -1074,7 +1193,7 @@ fn KQueue(comptime WSH: type) type {
 
         fn signal(self: *Self) !void {
             // called from thread pool thread, cant queue these in self.changes
-            _ = try posix.kevent(self.fd, &.{.{
+            _ = try sysKevent(self.fd, &.{.{
                 .ident = 1,
                 .filter = posix.system.EVFILT.USER,
                 .flags = 0,
@@ -1098,7 +1217,7 @@ fn KQueue(comptime WSH: type) type {
 
         fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {
             // called from the worker thread, can't use change_buffer
-            _ = try posix.kevent(self.fd, &.{.{
+            _ = try sysKevent(self.fd, &.{.{
                 .ident = @intCast(conn.getSocket()),
                 .filter = posix.system.EVFILT.READ,
                 .flags = posix.system.EV.ADD,
@@ -1122,7 +1241,7 @@ fn KQueue(comptime WSH: type) type {
 
             if (change_count == change_buffer.len) {
                 // calling this with an empty event_list will return immediate
-                _ = try posix.kevent(self.fd, change_buffer, &.{}, null);
+                _ = try sysKevent(self.fd, change_buffer, &.{}, null);
                 change_count = 0;
             }
             change_buffer[change_count] = .{
@@ -1139,7 +1258,7 @@ fn KQueue(comptime WSH: type) type {
         fn wait(self: *Self, timeout_sec: ?i32) !Iterator {
             const event_list = &self.event_list;
             const timeout: ?posix.timespec = if (timeout_sec) |ts| posix.timespec{ .sec = ts, .nsec = 0 } else null;
-            const event_count = try posix.kevent(self.fd, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
+            const event_count = try sysKevent(self.fd, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
             self.change_count = 0;
 
             return .{
@@ -1187,24 +1306,24 @@ fn EPoll(comptime WSH: type) type {
         const EpollEvent = linux.epoll_event;
 
         fn init() !Self {
-            const close_fd = try posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-            errdefer posix.close(close_fd);
+            const close_fd = try sysEventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+            errdefer sysClose(close_fd);
 
-            const event_fd = try posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-            errdefer posix.close(event_fd);
+            const event_fd = try sysEventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+            errdefer sysClose(event_fd);
 
             return .{
                 .close_fd = close_fd,
                 .event_fd = event_fd,
                 .event_list = undefined,
-                .fd = try posix.epoll_create1(0),
+                .fd = try sysEpollCreate1(0),
             };
         }
 
         fn deinit(self: *const Self) void {
-            posix.close(self.close_fd);
-            posix.close(self.event_fd);
-            posix.close(self.fd);
+            sysClose(self.close_fd);
+            sysClose(self.event_fd);
+            sysClose(self.fd);
         }
 
         fn start(self: *Self) !void {
@@ -1213,7 +1332,7 @@ fn EPoll(comptime WSH: type) type {
                     .data = .{ .ptr = 2 },
                     .events = linux.EPOLL.IN,
                 };
-                try std.posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, self.close_fd, &event);
+                try sysEpollCtl(self.fd, linux.EPOLL.CTL_ADD, self.close_fd, &event);
             }
 
             {
@@ -1221,14 +1340,14 @@ fn EPoll(comptime WSH: type) type {
                     .data = .{ .ptr = 1 },
                     .events = linux.EPOLL.IN | linux.EPOLL.ET,
                 };
-                try std.posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, self.event_fd, &event);
+                try sysEpollCtl(self.fd, linux.EPOLL.CTL_ADD, self.event_fd, &event);
             }
         }
 
         fn stop(self: *Self) void {
             // eventfd requires exactly 8 bytes; use u64 so 32-bit (e.g. Linux ARM) does not get EINVAL.
             const increment: u64 = 1;
-            _ = posix.write(self.close_fd, std.mem.asBytes(&increment)) catch |err| {
+            _ = sysWrite(self.close_fd, std.mem.asBytes(&increment)) catch |err| {
                 log.err("Failed to write to closefd: {}", .{err});
             };
         }
@@ -1236,16 +1355,16 @@ fn EPoll(comptime WSH: type) type {
         fn signal(self: *const Self) !void {
             // eventfd requires exactly 8 bytes; use u64 so 32-bit (e.g. Linux ARM) does not get EINVAL.
             const increment: u64 = 1;
-            _ = try posix.write(self.event_fd, std.mem.asBytes(&increment));
+            _ = try sysWrite(self.event_fd, std.mem.asBytes(&increment));
         }
 
         fn monitorAccept(self: *Self, fd: posix.fd_t) !void {
             var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.EXCLUSIVE, .data = .{ .ptr = 0 } };
-            return std.posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, fd, &event);
+            return sysEpollCtl(self.fd, linux.EPOLL.CTL_ADD, fd, &event);
         }
 
         fn pauseAccept(self: *Self, fd: posix.fd_t) !void {
-            return std.posix.epoll_ctl(self.fd, linux.EPOLL.CTL_DEL, fd, null);
+            return sysEpollCtl(self.fd, linux.EPOLL.CTL_DEL, fd, null);
         }
 
         fn monitorRead(self: *Self, conn: *Conn(WSH)) !void {
@@ -1253,7 +1372,7 @@ fn EPoll(comptime WSH: type) type {
                 .data = .{ .ptr = @intFromPtr(conn) },
                 .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
             };
-            return posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, conn.getSocket(), &event);
+            return sysEpollCtl(self.fd, linux.EPOLL.CTL_ADD, conn.getSocket(), &event);
         }
 
         fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {
@@ -1261,7 +1380,7 @@ fn EPoll(comptime WSH: type) type {
                 .data = .{ .ptr = @intFromPtr(conn) },
                 .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.ONESHOT,
             };
-            return posix.epoll_ctl(self.fd, linux.EPOLL.CTL_MOD, conn.getSocket(), &event);
+            return sysEpollCtl(self.fd, linux.EPOLL.CTL_MOD, conn.getSocket(), &event);
         }
 
         fn switchToOneShot(self: *Self, conn: *Conn(WSH)) !void {
@@ -1280,7 +1399,7 @@ fn EPoll(comptime WSH: type) type {
                 }
             }
 
-            const event_count = posix.epoll_wait(self.fd, event_list, timeout);
+            const event_count = sysEpollWait(self.fd, event_list, timeout);
             return .{
                 .index = 0,
                 .event_fd = self.event_fd,
@@ -1324,14 +1443,14 @@ fn Event(comptime WSH: type) type {
 // There's some shared logic between the NonBlocking and Blocking workers.
 // Whatever we can de-duplicate, goes here.
 const HTTPConnPool = struct {
-    mut: Thread.Mutex,
+    mut: httpz.Mutex,
     conns: []*HTTPConn,
     available: usize,
     allocator: Allocator,
     config: *const Config,
     buffer_pool: *BufferPool,
     retain_allocated_bytes: usize,
-    http_mem_pool_mut: Thread.Mutex,
+    http_mem_pool_mut: httpz.Mutex,
     http_mem_pool: std.heap.MemoryPool(HTTPConn),
 
     // we erase the type because we don't want Conn, and therefore Request and
@@ -1351,8 +1470,8 @@ const HTTPConnPool = struct {
         var conns = try allocator.alloc(*HTTPConn, min);
         errdefer allocator.free(conns);
 
-        var http_mem_pool = std.heap.MemoryPool(HTTPConn).init(allocator);
-        errdefer http_mem_pool.deinit();
+        var http_mem_pool = std.heap.MemoryPool(HTTPConn).empty;
+        errdefer http_mem_pool.deinit(allocator);
 
         var initialized: usize = 0;
         errdefer {
@@ -1362,7 +1481,7 @@ const HTTPConnPool = struct {
         }
 
         for (0..min) |i| {
-            const conn = try http_mem_pool.create();
+            const conn = try http_mem_pool.create(allocator);
             conn.* = try HTTPConn.init(allocator, buffer_pool, websocket, loop, config);
 
             conns[i] = conn;
@@ -1392,7 +1511,7 @@ const HTTPConnPool = struct {
             conn.deinit(allocator);
         }
         allocator.free(self.conns);
-        self.http_mem_pool.deinit();
+        self.http_mem_pool.deinit(allocator);
     }
 
     fn acquire(self: *HTTPConnPool) !*HTTPConn {
@@ -1404,7 +1523,7 @@ const HTTPConnPool = struct {
             self.unlock();
 
             self.http_mem_pool_mut.lock();
-            const conn = try self.http_mem_pool.create();
+            const conn = try self.http_mem_pool.create(self.allocator);
             self.http_mem_pool_mut.unlock();
             errdefer {
                 self.http_mem_pool_mut.lock();
@@ -1489,7 +1608,7 @@ pub fn Conn(comptime WSH: type) type {
 
         fn close(self: *Self) void {
             switch (self.protocol) {
-                .http => |http_conn| posix.close(http_conn.stream.handle),
+                .http => |http_conn| sysClose(http_conn.stream.handle),
                 .websocket => |hc| hc.conn.close(.{}) catch {},
             }
         }
@@ -1560,7 +1679,7 @@ pub const HTTPConn = struct {
     // can be concurrently accessed, use getState
     _state: State,
 
-    _mut: Thread.Mutex,
+    _mut: httpz.Mutex,
 
     _io_mode: IOMode,
 
@@ -1572,8 +1691,8 @@ pub const HTTPConn = struct {
     // number of requests made on this connection (within a keepalive session)
     request_count: u64,
 
-    stream: net.Stream,
-    address: net.Address,
+    stream: Stream,
+    address: Address,
     socket_flags: usize,
 
     // Data needed to parse a request. This contains pre-allocated memory, e.g.
@@ -1676,7 +1795,7 @@ pub const HTTPConn = struct {
         const socket = self.stream.handle;
         switch (comptime loopType()) {
             .kqueue => {
-                _ = try posix.kevent(loop, &.{
+                _ = try sysKevent(loop, &.{
                     .{
                         .ident = @intCast(socket),
                         .filter = posix.system.EVFILT.READ,
@@ -1688,7 +1807,7 @@ pub const HTTPConn = struct {
                 }, &.{}, null);
             },
             .epoll => {
-                return posix.epoll_ctl(loop, std.os.linux.EPOLL.CTL_DEL, socket, null);
+                return sysEpollCtl(loop, std.os.linux.EPOLL.CTL_DEL, socket, null);
             },
         }
     }
@@ -1709,7 +1828,7 @@ pub const HTTPConn = struct {
         var blocking = false;
 
         while (i < data.len) {
-            const n = posix.write(socket, data[i..]) catch |err| switch (err) {
+            const n = sysWrite(socket, data[i..]) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.blockingMode();
                     blocking = true;
@@ -1762,7 +1881,7 @@ pub const HTTPConn = struct {
         if (self._io_mode == .blocking) {
             return;
         }
-        _ = try posix.fcntl(self.stream.handle, posix.F.SETFL, self.socket_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+        _ = try sysFcntl(self.stream.handle, posix.F.SETFL, self.socket_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
         self._io_mode = .blocking;
     }
 
@@ -1775,7 +1894,7 @@ pub const HTTPConn = struct {
         if (self._io_mode == .nonblocking) {
             return;
         }
-        _ = try posix.fcntl(self.stream.handle, posix.F.SETFL, self.socket_flags);
+        _ = try sysFcntl(self.stream.handle, posix.F.SETFL, self.socket_flags);
         self._io_mode = .nonblocking;
     }
 };
@@ -1785,7 +1904,7 @@ pub fn timestamp(clamp: u32) u32 {
         const value: u32 = @intCast(std.time.timestamp());
         return if (value <= clamp) return clamp + 1 else value;
     }
-    const ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
+    const ts = sysClockGettime(posix.CLOCK.MONOTONIC) catch unreachable;
     return @intCast(ts.sec);
 }
 
@@ -1841,7 +1960,7 @@ fn writeError(socket: posix.socket_t, comptime status: u16, comptime msg: []cons
 
     var i: usize = 0;
     while (i < msg.len) {
-        i += try posix.write(socket, response[i..]);
+        i += try sysWrite(socket, response[i..]);
     }
 }
 
@@ -1856,6 +1975,161 @@ fn loopType() LoopType {
         .linux => .epoll,
         else => unreachable,
     };
+}
+
+// ---------------------------------------------------------------------------
+// System call wrappers for APIs removed from std.posix in zig 0.16
+// ---------------------------------------------------------------------------
+
+const is_linux = builtin.os.tag == .linux;
+
+inline fn sysErrno(rc: anytype) posix.E {
+    if (comptime is_linux) {
+        return std.os.linux.errno(rc);
+    } else {
+        return std.c.errno(rc);
+    }
+}
+
+fn sysClose(fd: posix.fd_t) void {
+    _ = sys.close(fd);
+}
+
+fn sysWrite(fd: posix.fd_t, buf: []const u8) !usize {
+    const rc = sys.write(fd, buf.ptr, buf.len);
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return switch (e) {
+            .AGAIN => error.WouldBlock,
+            .PIPE => error.BrokenPipe,
+            .CONNRESET => error.ConnectionResetByPeer,
+            else => error.Unexpected,
+        };
+    }
+    return @intCast(rc);
+}
+
+fn sysAccept(fd: posix.socket_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t, flags: u32) !posix.socket_t {
+    const use_accept4 = comptime is_linux;
+    const rc = if (use_accept4) sys.accept4(fd, addr, len, @intCast(flags)) else sys.accept(fd, addr, len);
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return switch (e) {
+            .AGAIN => error.WouldBlock,
+            .CONNABORTED => error.ConnectionAborted,
+            .INVAL => error.SocketNotListening,
+            else => error.Unexpected,
+        };
+    }
+    const socket: posix.socket_t = @intCast(rc);
+    // On macOS/BSD without accept4, set flags manually
+    if (comptime !use_accept4) {
+        if (flags != 0) {
+            const NONBLOCK = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+            if (flags & posix.SOCK.NONBLOCK != 0) {
+                const current_flags = try sysFcntl(socket, posix.F.GETFL, 0);
+                _ = try sysFcntl(socket, posix.F.SETFL, current_flags | NONBLOCK);
+            }
+            if (flags & posix.SOCK.CLOEXEC != 0) {
+                const fd_flags = try sysFcntl(socket, posix.F.GETFD, 0);
+                _ = try sysFcntl(socket, posix.F.SETFD, fd_flags | @as(u32, posix.FD_CLOEXEC));
+            }
+        }
+    }
+    return socket;
+}
+
+fn sysFcntl(fd: posix.fd_t, cmd: i32, arg: usize) !usize {
+    if (comptime is_linux) {
+        const rc = sys.fcntl(fd, cmd, arg);
+        const e = sysErrno(rc);
+        if (e != .SUCCESS) {
+            return error.Unexpected;
+        }
+        return @intCast(rc);
+    } else {
+        // macOS: fcntl is variadic, cmd is c_int
+        const rc = sys.fcntl(fd, @intCast(cmd), @as(c_int, @intCast(arg)));
+        const e = sysErrno(rc);
+        if (e != .SUCCESS) {
+            return error.Unexpected;
+        }
+        return @intCast(rc);
+    }
+}
+
+fn sysKqueue() !i32 {
+    const rc = sys.kqueue();
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return error.Unexpected;
+    }
+    return @intCast(rc);
+}
+
+fn sysKevent(kq: i32, changelist: []const posix.Kevent, eventlist: []posix.Kevent, timeout: ?*const posix.timespec) !usize {
+    const rc = sys.kevent(
+        kq,
+        changelist.ptr,
+        @intCast(changelist.len),
+        eventlist.ptr,
+        @intCast(eventlist.len),
+        timeout,
+    );
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return error.Unexpected;
+    }
+    return @intCast(rc);
+}
+
+fn sysEpollCreate1(flags: u32) !i32 {
+    if (comptime !is_linux) @compileError("epoll is Linux-only");
+    const rc = std.os.linux.epoll_create1(@as(usize, flags));
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return error.Unexpected;
+    }
+    return @intCast(rc);
+}
+
+fn sysEpollCtl(epfd: i32, op: u32, fd: posix.fd_t, event: ?*std.os.linux.epoll_event) !void {
+    if (comptime !is_linux) @compileError("epoll is Linux-only");
+    const rc = std.os.linux.epoll_ctl(epfd, op, fd, event);
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return error.Unexpected;
+    }
+}
+
+fn sysEpollWait(epfd: i32, events: []std.os.linux.epoll_event, timeout: i32) usize {
+    if (comptime !is_linux) @compileError("epoll is Linux-only");
+    const rc = std.os.linux.epoll_wait(epfd, events.ptr, @intCast(events.len), timeout);
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return 0;
+    }
+    return @intCast(rc);
+}
+
+fn sysEventfd(initval: u32, flags: u32) !posix.fd_t {
+    if (comptime !is_linux) @compileError("eventfd is Linux-only");
+    const rc = std.os.linux.eventfd(initval, flags);
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return error.Unexpected;
+    }
+    return @intCast(rc);
+}
+
+fn sysClockGettime(clk_id: anytype) !posix.timespec {
+    var ts: posix.timespec = undefined;
+    const rc = sys.clock_gettime(clk_id, &ts);
+    const e = sysErrno(rc);
+    if (e != .SUCCESS) {
+        return error.Unexpected;
+    }
+    return ts;
 }
 
 const t = @import("t.zig");
