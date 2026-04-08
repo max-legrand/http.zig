@@ -1985,7 +1985,12 @@ const is_linux = builtin.os.tag == .linux;
 
 inline fn sysErrno(rc: anytype) posix.E {
     if (comptime is_linux) {
-        return std.os.linux.errno(rc);
+        const urc: usize = switch (@TypeOf(rc)) {
+            usize => rc,
+            isize => @bitCast(rc),
+            else => @bitCast(@as(isize, rc)),
+        };
+        return std.os.linux.errno(urc);
     } else {
         return std.c.errno(rc);
     }
