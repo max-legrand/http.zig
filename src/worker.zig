@@ -970,6 +970,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             while (conn) |c| {
                 const timeout = c.protocol.http.timeout;
                 if (timeout > now) {
+                    // c is the new head; its prev must be cleared, else it keeps
+                    // pointing at a timed-out conn that's about to be destroyed
+                    // (List.remove would then write through the dangling prev and
+                    // fail to update list.head).
+                    c.prev = null;
                     list.head = c;
                     return .{ timed_out, count, timeout };
                 }
