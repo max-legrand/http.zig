@@ -780,20 +780,27 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 break :blk head;
             };
 
+            // Everything below operates on the snapshot, which is no longer the
+            // handover_list: these conns keep _state == .handover but their
+            // next/prev now describe the detached chain. They must be released
+            // with releaseDetached, never disown(), or List.remove would splice
+            // the detached chain into the live handover_list.
             while (c) |conn| {
                 c = conn.next;
+                conn.prev = null;
+                conn.next = null;
                 const http_conn = conn.protocol.http;
                 switch (http_conn.handover) {
                     .close, .unknown => {
                         closed_bool.* = true;
                         // Remove from the event loop and close here, on the loop
-                        // thread, before disown() recycles the Conn. The fd is
-                        // still open (processHTTPData no longer closes it on the
-                        // worker thread), so the DEL is valid and no later batch
-                        // can deliver a .recv for the freed Conn.
+                        // thread, before the Conn is recycled. The fd is still
+                        // open (processHTTPData no longer closes it on the worker
+                        // thread), so the DEL is valid and no later batch can
+                        // deliver a .recv for the freed Conn.
                         loop.remove(conn);
                         conn.close();
-                        self.disown(conn);
+                        self.releaseDetached(conn);
                     },
                     .disown => {
                         // When res.disown() was called, we immediately removed
@@ -802,14 +809,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         // before we get back here.
                         // https://github.com/karlseguin/http.zig/issues/129#issuecomment-3031411404
                         closed_bool.* = true;
-                        self.disown(conn);
+                        self.releaseDetached(conn);
                     },
                     .websocket => |ptr| {
                         if (comptime WSH == httpz.DummyWebsocketHandler) {
                             std.debug.print("Your httpz handler must have a `WebsocketHandler` declaration. This must be the same type passed to `httpz.upgradeWebsocket`. Closing the connection.\n", .{});
                             closed_bool.* = true;
                             conn.close();
-                            self.disown(conn);
+                            self.releaseDetached(conn);
                             continue;
                         }
 
@@ -821,8 +828,15 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         loop.switchToOneShot(conn) catch {
                             metrics.internalError();
                             closed_bool.* = true;
+                            // The HTTPConn is already back in the pool and
+                            // conn.protocol is now .websocket, so neither disown
+                            // nor releaseDetached applies here - going through
+                            // either would read protocol.http (an inactive union
+                            // field) and release the HTTPConn a second time.
                             conn.close();
-                            self.disown(conn);
+                            self.websocket.cleanupConn(hc);
+                            self.len -= 1;
+                            self.conn_mem_pool.destroy(conn);
                             continue;
                         };
                     },
@@ -907,17 +921,30 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             }
         }
 
+        // Unlinks the connection from whichever list its state says it's in, and
+        // then releases it. Only valid when the connection really is still in
+        // that list - see releaseDetached for connections which have already
+        // been unlinked (timed out, or snapshotted out of the handover list).
         fn disown(self: *Self, conn: *Conn(WSH)) void {
             const io = self.io;
-            const http_conn = conn.protocol.http;
-            switch (http_conn._state) {
+            switch (conn.protocol.http._state) {
                 .request => self.request_list.remove(conn),
                 .handover => self.handover_list.remove(io, conn),
                 .keepalive => self.keepalive_list.remove(io, conn),
                 .active => unreachable,
             }
+            self.releaseDetached(conn);
+        }
+
+        // Releases a connection which is no longer linked into one of the four
+        // state lists. Calling disown() on such a connection corrupts the list
+        // its _state points at: List.remove would splice using the conn's stale
+        // next/prev (which now belong to the detached chain it was moved to),
+        // writing a soon-to-be-freed conn into the live list's head/tail. The
+        // list would then walk freed memory on the next prepareToWait.
+        fn releaseDetached(self: *Self, conn: *Conn(WSH)) void {
             self.len -= 1;
-            self.http_conn_pool.release(http_conn);
+            self.http_conn_pool.release(conn.protocol.http);
             self.conn_mem_pool.destroy(conn);
         }
 
@@ -987,12 +1014,15 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             return .{ timed_out, count, null };
         }
 
+        // `list` is the detached chain built by collectTimedOut - these conns are
+        // no longer in request_list/keepalive_list, so they must not be disowned
+        // (which would try to remove them from a list they've already left).
         fn closeList(self: *Self, list: List(Conn(WSH))) void {
             var conn = list.head;
             while (conn) |c| {
                 conn = c.next;
                 c.close();
-                self.disown(c);
+                self.releaseDetached(c);
             }
         }
 
