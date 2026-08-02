@@ -990,27 +990,22 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // a connection that isn't timed out, we can break;
         // This returns the next timeout.
         fn collectTimedOut(list: *List(Conn(WSH)), now: u32) struct { List(Conn(WSH)), usize, ?u32 } {
-            var conn = list.head;
             var count: usize = 0;
             var timed_out: List(Conn(WSH)) = .{};
 
-            while (conn) |c| {
-                const timeout = c.protocol.http.timeout;
-                if (timeout > now) {
-                    // c is the new head; its prev must be cleared, else it keeps
-                    // pointing at a timed-out conn that's about to be destroyed
-                    // (List.remove would then write through the dangling prev and
-                    // fail to update list.head).
-                    c.prev = null;
-                    list.head = c;
-                    return .{ timed_out, count, timeout };
-                }
+            // Move each expired connection with List.remove rather than manually
+            // rewiring head/prev. Apart from making the ownership transfer
+            // explicit, this keeps both lists internally consistent after every
+            // iteration: no live list link can point at a Conn that has been
+            // detached and is about to be returned to its pool.
+            while (list.head) |conn| {
+                const timeout = conn.protocol.http.timeout;
+                if (timeout > now) return .{ timed_out, count, timeout };
+
+                list.remove(conn);
+                timed_out.insert(conn);
                 count += 1;
-                conn = c.next;
-                timed_out.insert(c);
             }
-            list.head = null;
-            list.tail = null;
             return .{ timed_out, count, null };
         }
 
