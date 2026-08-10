@@ -1016,6 +1016,12 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             var conn = list.head;
             while (conn) |c| {
                 conn = c.next;
+                // Explicitly delete the event-loop registration before recycling
+                // Conn. close() alone does not prevent a ready event already
+                // queued by epoll/kqueue from carrying this Conn pointer; once
+                // pooled and reused, that stale event can disown the new
+                // connection and leave a freed Conn in a timeout list.
+                self.loop.remove(c);
                 c.close();
                 self.releaseDetached(c);
             }
