@@ -517,7 +517,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
             self.shutdownList(&self.request_list);
             self.shutdownConcurrentList(&self.active_list);
-            self.shutdownConcurrentList(&self.handover_list);
+            self.shutdownHandoverList(&self.handover_list);
             self.shutdownConcurrentList(&self.keepalive_list);
 
             self.buffer_pool.deinit();
@@ -800,7 +800,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         // deliver a .recv for the freed Conn.
                         loop.remove(conn);
                         conn.close();
-                        self.releaseDetached(conn);
+                        self.release(conn, http_conn); // detached snapshot: not disown!
                     },
                     .disown => {
                         // When res.disown() was called, we immediately removed
@@ -809,14 +809,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         // before we get back here.
                         // https://github.com/karlseguin/http.zig/issues/129#issuecomment-3031411404
                         closed_bool.* = true;
-                        self.releaseDetached(conn);
+                        self.release(conn, http_conn); // detached snapshot: not disown!
                     },
                     .websocket => |ptr| {
                         if (comptime WSH == httpz.DummyWebsocketHandler) {
                             std.debug.print("Your httpz handler must have a `WebsocketHandler` declaration. This must be the same type passed to `httpz.upgradeWebsocket`. Closing the connection.\n", .{});
                             closed_bool.* = true;
                             conn.close();
-                            self.releaseDetached(conn);
+                            self.release(conn, http_conn); // detached snapshot: not disown!
                             continue;
                         }
 
@@ -923,17 +923,18 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
         // Unlinks the connection from whichever list its state says it's in, and
         // then releases it. Only valid when the connection really is still in
-        // that list - see releaseDetached for connections which have already
-        // been unlinked (timed out, or snapshotted out of the handover list).
+        // that list - see release() for connections which have already been
+        // unlinked (timed out, or snapshotted out of the handover list).
         fn disown(self: *Self, conn: *Conn(WSH)) void {
             const io = self.io;
-            switch (conn.protocol.http._state) {
+            const http_conn = conn.protocol.http;
+            switch (http_conn._state) {
                 .request => self.request_list.remove(conn),
                 .handover => self.handover_list.remove(io, conn),
                 .keepalive => self.keepalive_list.remove(io, conn),
                 .active => unreachable,
             }
-            self.releaseDetached(conn);
+            self.release(conn, http_conn);
         }
 
         // Releases a connection which is no longer linked into one of the four
@@ -942,9 +943,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // next/prev (which now belong to the detached chain it was moved to),
         // writing a soon-to-be-freed conn into the live list's head/tail. The
         // list would then walk freed memory on the next prepareToWait.
-        fn releaseDetached(self: *Self, conn: *Conn(WSH)) void {
+        // `http_conn` is passed explicitly because conn.protocol may already
+        // have been re-tagged (e.g. to .websocket) by the time we get here.
+        fn release(self: *Self, conn: *Conn(WSH), http_conn: *HTTPConn) void {
             self.len -= 1;
-            self.http_conn_pool.release(conn.protocol.http);
+            self.http_conn_pool.release(http_conn);
             self.conn_mem_pool.destroy(conn);
         }
 
@@ -1012,6 +1015,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // `list` is the detached chain built by collectTimedOut - these conns are
         // no longer in request_list/keepalive_list, so they must not be disowned
         // (which would try to remove them from a list they've already left).
+        // Hence release().
         fn closeList(self: *Self, list: List(Conn(WSH))) void {
             var conn = list.head;
             while (conn) |c| {
@@ -1023,7 +1027,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 // connection and leave a freed Conn in a timeout list.
                 self.loop.remove(c);
                 c.close();
-                self.releaseDetached(c);
+                self.release(c, c.protocol.http);
             }
         }
 
@@ -1043,6 +1047,29 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             list.mut.lockUncancelable(io);
             defer list.mut.unlock(io);
             self.shutdownList(&list.inner);
+        }
+
+        // handover_list is the one list where we might not own the socket, so it
+        // can't use shutdownList's unconditional close.
+        fn shutdownHandoverList(self: *Self, list: *ConcurrentList(Conn(WSH))) void {
+            const io = self.io;
+            const allocator = self.allocator;
+            list.mut.lockUncancelable(io);
+            defer list.mut.unlock(io);
+
+            var conn = list.inner.head;
+            while (conn) |c| {
+                conn = c.next;
+                const http_conn = c.protocol.http;
+                switch (http_conn.handover) {
+                    .disown, .websocket => {},
+                    .close, .unknown => posix.close(http_conn.stream.socket.handle),
+                    // processHTTPData sends keepalive conns to keepalive_list,
+                    // they never reach handover_list.
+                    .keepalive => unreachable,
+                }
+                http_conn.deinit(allocator);
+            }
         }
 
         inline fn enableListener(self: *Self, listener: posix.fd_t) void {
@@ -1614,7 +1641,7 @@ pub fn Conn(comptime WSH: type) type {
 
         pub fn acquireProcessing(self: *Self) bool {
             // returns true if it was previously false
-            return @atomicRmw(bool, &self.processing, .Xchg, true, .monotonic) == false;
+            return @atomicRmw(bool, &self.processing, .Xchg, true, .acquire) == false;
         }
 
         pub fn releaseProcessing(self: *Self) void {
