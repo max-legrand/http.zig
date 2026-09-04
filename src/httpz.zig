@@ -2140,6 +2140,87 @@ test "websocket: upgrade" {
     try t.expectString(&.{ 136, 2, 3, 232 }, buf[12..16]);
 }
 
+// https://github.com/karlseguin/http.zig - a closed websocket used to leak its
+// Conn wrapper: the ws.HandlerConn was freed on the thread pool thread, but the
+// Conn(WSH) that the event loop hands back as userdata was never destroyed and
+// self.len was never decremented. Every websocket session therefore consumed a
+// max_conn slot for the lifetime of the process, and a stale readiness event
+// could still dispatch the recycled ws.HandlerConn.
+//
+// With max_conn = 2 and 6 sequential websocket sessions, the leak alone is
+// enough to permanently pause the listener: the plain HTTP request at the end
+// then never gets served.
+test "websocket: closed connections release their slot" {
+    if (force_blocking) return; // non-blocking mode only
+
+    const port = 6996;
+    var server = try Server(TestWebsocketHandler).init(t.io, t.allocator, .{
+        .address = .localhost(port),
+        .workers = .{ .count = 1, .min_conn = 1, .max_conn = 2 },
+    }, TestWebsocketHandler{});
+    var router = try server.router(.{});
+    router.get("/ws", TestWebsocketHandler.upgrade, .{});
+    router.get("/ping", TestWebsocketHandler.ping, .{});
+    const thrd = try server.listenInNewThread();
+    defer {
+        server.stop();
+        thrd.join();
+        server.deinit();
+    }
+
+    for (0..6) |i| {
+        const stream = testStream(port);
+
+        var writer = stream.writer(t.io, &.{});
+        const w = &writer.interface;
+        try w.writeAll("GET /ws HTTP/1.1\r\nContent-Length: 0\r\n");
+        try w.writeAll("upgrade: websocket\r\n");
+        try w.writeAll("Sec-Websocket-Version: 13\r\n");
+        try w.writeAll("Connection: upgrade\r\n");
+        try w.writeAll("Sec-Websocket-Key: a-secret-key\r\n\r\n");
+        try w.flush();
+
+        // Read with the timeout-tolerant helper: once the leak has paused the
+        // listener there is no response at all, and we want a clear failure
+        // rather than a read panic.
+        var hbuf: [1024]u8 = undefined;
+        const handshake = testReadAll(stream, &hbuf);
+        if (std.mem.startsWith(u8, handshake, "HTTP/1.1 101") == false) {
+            std.debug.print("websocket handshake #{d} was not served (max_conn exhausted?), got: '{s}'\n", .{ i, handshake });
+            stream.close(t.io);
+            return error.WebsocketConnectionSlotLeaked;
+        }
+
+        if (i % 2 == 0) {
+            // server-initiated close (handler calls conn.close)
+            try w.writeAll(&websocket.frameText("close"));
+            try w.flush();
+            try t.io.sleep(.fromMilliseconds(5), .awake);
+            stream.close(t.io);
+        } else {
+            // abrupt client disconnect, without a close frame
+            stream.close(t.io);
+        }
+
+        // let the worker drain the batch and reclaim the connection
+        try t.io.sleep(.fromMilliseconds(20), .awake);
+    }
+
+    const stream = testStream(port);
+    defer stream.close(t.io);
+    var writer = stream.writer(t.io, &.{});
+    const w = &writer.interface;
+    try w.writeAll("GET /ping HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    try w.flush();
+
+    var buf: [1024]u8 = undefined;
+    const reply = testReadAll(stream, &buf);
+    if (std.mem.endsWith(u8, reply, "pong") == false) {
+        std.debug.print("plain request after 6 websocket sessions was not served, got: '{s}'\n", .{reply});
+        return error.WebsocketConnectionSlotLeaked;
+    }
+}
+
 // Stress test: multiple concurrent websocket clients sending many messages each.
 // Run repeatedly (e.g. zig build test -Dtest-filter="websocket: stress" or run 50x)
 // to verify no race in reader.done() / allocator free when using thread pool.
@@ -2647,6 +2728,10 @@ const TestWebsocketHandler = struct {
             res.status = 500;
             res.body = "invalid websocket";
         }
+    }
+
+    pub fn ping(_: TestWebsocketHandler, _: *Request, res: *Response) !void {
+        res.body = "pong";
     }
 };
 

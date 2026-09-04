@@ -408,6 +408,13 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // that alone) and the worker thread will process it.
         handover_list: ConcurrentList(Conn(WSH)),
 
+        // Websocket connections whose read loop has ended (protocol error, peer
+        // close, or a failed re-arm). The thread pool inserts here and signals
+        // the worker; the worker frees them once the current event batch has
+        // been fully drained - a batch can still hold a stale pointer to the
+        // Conn, and the ws.HandlerConn it points at must outlive that.
+        ws_close_list: ConcurrentList(Conn(WSH)),
+
         // A pool of HTTPConn objects. The pool maintains a configured min # of these.
         // An HTTPConn is relatively expensive, since we pre-allocate all types
         // of things (a Request.State and Response.State).
@@ -488,6 +495,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .request_list = .{},
                 .handover_list = .{},
                 .keepalive_list = .{},
+                .ws_close_list = .{},
                 .buffer_pool = buffer_pool,
                 .conn_mem_pool = conn_mem_pool,
                 .http_conn_pool = http_conn_pool,
@@ -620,15 +628,28 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                                     // maybe a write fail or something, doesn't matter, we're closing the connection
                                     requestError(http_conn, reader.err orelse err) catch {};
 
-                                    // impossible to fail when false is passed
+                                    // Do not recycle the Conn while iterating an event batch. A later
+                                    // event in this batch can still contain this Conn as userdata, even
+                                    // after EPOLL_CTL_DEL/EV_DELETE. Move it to handover instead; the
+                                    // end-of-batch processSignal call removes, closes, and releases it.
                                     http_conn.requestDone(self.retain_allocated_bytes, false) catch unreachable;
-                                    conn.close();
-                                    self.disown(conn);
-                                    if (self.full) self.enableListener(listener);
+                                    http_conn.handover = .close;
+                                    self.swapList(conn, .handover);
+                                    has_signal = true;
                                     continue;
                                 };
 
                                 if (done == false) {
+                                    // Partial request. If this connection was idle in
+                                    // keepalive, it still carries the keepalive deadline;
+                                    // give it the (usually much shorter) request deadline,
+                                    // otherwise a client that sends one byte and stalls is
+                                    // held for the whole keepalive window. The deadline is
+                                    // only set on entry to .request, so a trickling client
+                                    // cannot keep pushing it back.
+                                    if (http_conn._state == .keepalive) {
+                                        http_conn.timeout = now + self.timeout_request;
+                                    }
                                     self.swapList(conn, .request);
                                     continue;
                                 }
@@ -732,6 +753,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 const ip_address = address.toIOAddress();
 
                 const http_conn = try self.http_conn_pool.acquire();
+                errdefer self.http_conn_pool.release(http_conn);
                 http_conn.request_count = 1;
                 http_conn._state = .request;
                 http_conn.handover = .unknown;
@@ -749,8 +771,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 };
                 self.request_list.insert(conn);
                 errdefer {
-                    conn.close();
-                    self.disown(conn);
+                    // The earlier errdefers close the socket, release http_conn, and
+                    // destroy conn. Only undo ownership established above here; calling
+                    // disown would destroy conn a second time while unwinding.
+                    self.request_list.remove(conn);
+                    self.len -= 1;
                 }
 
                 try self.loop.monitorRead(conn);
@@ -759,6 +784,37 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         }
 
         fn processSignal(self: *Self, closed_bool: *bool) void {
+            self.processHandovers(closed_bool);
+            self.processWebsocketCloses(closed_bool);
+        }
+
+        // Frees the websocket connections which retireWebsocket() queued. Runs on
+        // the worker thread once the event batch has been fully drained, so no
+        // event in that batch can still reach the Conn or its ws.HandlerConn.
+        fn processWebsocketCloses(self: *Self, closed_bool: *bool) void {
+            const io = self.io;
+            var list = &self.ws_close_list;
+
+            var c = blk: {
+                list.mut.lockUncancelable(io);
+                defer list.mut.unlock(io);
+                const head = list.inner.head;
+                list.inner = .{};
+                break :blk head;
+            };
+
+            while (c) |conn| {
+                c = conn.next;
+                conn.next = null;
+                conn.prev = null;
+                closed_bool.* = true;
+                self.websocket.cleanupConn(conn.protocol.websocket);
+                self.len -= 1;
+                self.conn_mem_pool.destroy(conn);
+            }
+        }
+
+        fn processHandovers(self: *Self, closed_bool: *bool) void {
             const io = self.io;
             const loop = &self.loop;
             var hl = &self.handover_list;
@@ -815,6 +871,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         if (comptime WSH == httpz.DummyWebsocketHandler) {
                             std.debug.print("Your httpz handler must have a `WebsocketHandler` declaration. This must be the same type passed to `httpz.upgradeWebsocket`. Closing the connection.\n", .{});
                             closed_bool.* = true;
+                            loop.remove(conn);
                             conn.close();
                             self.release(conn, http_conn); // detached snapshot: not disown!
                             continue;
@@ -833,6 +890,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                             // nor releaseDetached applies here - going through
                             // either would read protocol.http (an inactive union
                             // field) and release the HTTPConn a second time.
+                            loop.remove(conn);
                             conn.close();
                             self.websocket.cleanupConn(hc);
                             self.len -= 1;
@@ -857,7 +915,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             }
         }
 
-        pub fn processHTTPData(self: *Self, now: u32, conn: *Conn(WSH), thread_buf: []u8, http_conn: *HTTPConn) void {
+        // The timestamp of the batch this request was dispatched in is deliberately
+        // unused: deadlines are set from the current time, at the point where the
+        // connection actually changes state.
+        pub fn processHTTPData(self: *Self, _: u32, conn: *Conn(WSH), thread_buf: []u8, http_conn: *HTTPConn) void {
             metrics.request();
             http_conn.request_count += 1;
             self.server.handleRequest(http_conn, thread_buf);
@@ -872,7 +933,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
             switch (handover) {
                 .keepalive => {
-                    http_conn.timeout = now + self.timeout_keepalive;
+                    // Measure the idle window from now, when the connection actually
+                    // becomes idle. The dispatch timestamp can be far in the past for
+                    // a slow handler, which would hand back a keepalive deadline that
+                    // is already (nearly) expired.
+                    http_conn.timeout = timestamp(self.io) + self.timeout_keepalive;
                     self.swapList(conn, .keepalive);
                     return;
                 },
@@ -897,12 +962,9 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             var ws_conn = &hc.conn;
             const success = self.websocket.worker.dataAvailable(hc, thread_buf);
             if (success == false) {
-                ws_conn.close(.{ .code = 4997, .reason = "wsz" }) catch {};
-                self.websocket.cleanupConn(hc);
-                conn.releaseProcessing();
+                self.retireWebsocket(conn, ws_conn, 4997);
             } else if (ws_conn.isClosed()) {
-                self.websocket.cleanupConn(hc);
-                conn.releaseProcessing();
+                self.retireWebsocket(conn, ws_conn, null);
             } else {
                 // Release `processing` before re-arming. With EPOLLONESHOT, re-arming
                 // while still holding `processing` loses a read that arrives in the
@@ -915,10 +977,43 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 conn.releaseProcessing();
                 self.loop.rearmRead(conn) catch |err| {
                     log.debug("({f}) failed to add read event monitor: {}", .{ ws_conn.address, err });
-                    ws_conn.close(.{ .code = 4998, .reason = "wsz" }) catch {};
-                    self.websocket.cleanupConn(hc);
+                    self.retireWebsocket(conn, ws_conn, 4998);
                 };
             }
+        }
+
+        // Ends a websocket connection. Called from a thread pool thread.
+        //
+        // We must not free anything here. `conn` is the userdata the event loop
+        // hands back with each readiness event, and the current batch may already
+        // hold a stale pointer to it. Freeing the ws.HandlerConn here (as this
+        // used to do) left that stale event pointing at a recycled hc, and never
+        // freeing the Conn leaked both the wrapper and a max_conn slot for the
+        // lifetime of the process.
+        //
+        // Instead: close the socket (which also removes it from epoll/kqueue),
+        // then hand the Conn to the worker thread, which frees it after the
+        // current batch is drained. `closing` is left set and `processing` is
+        // never released, so no further event can dispatch this connection.
+        fn retireWebsocket(self: *Self, conn: *Conn(WSH), ws_conn: *ws.Conn, close_code: ?u16) void {
+            if (conn.markClosing() == false) {
+                // another terminal path already queued this connection
+                return;
+            }
+
+            if (close_code) |code| {
+                ws_conn.close(.{ .code = code, .reason = "wsz" }) catch {};
+            } else {
+                // already closed by the peer/handler; make sure the fd is gone
+                ws_conn.close(.{}) catch {};
+            }
+
+            // Deliberately no loop.remove() here: ws_conn.close() may already have
+            // closed the fd, and a DEL on a closed (possibly recycled) fd could
+            // deregister an unrelated connection. Closing the fd is what removes
+            // it from the event loop.
+            self.ws_close_list.insert(self.io, conn);
+            self.loop.signal() catch |err| log.err("failed to signal worker: {}", .{err});
         }
 
         // Unlinks the connection from whichever list its state says it's in, and
@@ -989,27 +1084,48 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             return .{ closed, @intCast(next - now) };
         }
 
-        // lists are ordered from soonest to timeout to last, as soon as we find
-        // a connection that isn't timed out, we can break;
-        // This returns the next timeout.
+        // Scans the whole list, moving every expired connection into a detached
+        // chain and returning the earliest deadline among the survivors.
+        //
+        // This used to stop at the first unexpired entry, assuming the list was
+        // ordered by deadline. It is not: a connection is appended when a thread
+        // pool thread finishes with it, and it carries the deadline computed from
+        // the `now` of the batch it was dispatched in. A slow request dispatched
+        // early can therefore be appended after a fast one dispatched later, so
+        // the list holds [later deadline, earlier deadline] and everything behind
+        // that first unexpired node is never reaped - it keeps its worker slot,
+        // and stays in the list (and in the event loop) indefinitely.
+        //
+        // A full scan is O(list) once per second per worker, bounded by max_conn.
+        //
+        // Each expired connection is moved with List.remove rather than manually
+        // rewiring head/prev. Apart from making the ownership transfer explicit,
+        // this keeps both lists internally consistent after every iteration: no
+        // live list link can point at a Conn that has been detached and is about
+        // to be returned to its pool.
         fn collectTimedOut(list: *List(Conn(WSH)), now: u32) struct { List(Conn(WSH)), usize, ?u32 } {
             var count: usize = 0;
             var timed_out: List(Conn(WSH)) = .{};
+            var next_timeout: ?u32 = null;
 
-            // Move each expired connection with List.remove rather than manually
-            // rewiring head/prev. Apart from making the ownership transfer
-            // explicit, this keeps both lists internally consistent after every
-            // iteration: no live list link can point at a Conn that has been
-            // detached and is about to be returned to its pool.
-            while (list.head) |conn| {
-                const timeout = conn.protocol.http.timeout;
-                if (timeout > now) return .{ timed_out, count, timeout };
+            var conn = list.head;
+            while (conn) |c| {
+                // capture the successor before c is unlinked
+                conn = c.next;
 
-                list.remove(conn);
-                timed_out.insert(conn);
+                const timeout = c.protocol.http.timeout;
+                if (timeout > now) {
+                    if (next_timeout == null or timeout < next_timeout.?) {
+                        next_timeout = timeout;
+                    }
+                    continue;
+                }
+
+                list.remove(c);
+                timed_out.insert(c);
                 count += 1;
             }
-            return .{ timed_out, count, null };
+            return .{ timed_out, count, next_timeout };
         }
 
         // `list` is the detached chain built by collectTimedOut - these conns are
@@ -1438,7 +1554,19 @@ fn EPoll(comptime WSH: type) type {
 
                 switch (events[index].data.ptr) {
                     0 => return .{ .accept = {} },
-                    1 => return .{ .signal = {} },
+                    1 => {
+                        // The signal eventfd is registered edge-triggered, so it only
+                        // wakes the loop on a state change. Drain the counter here;
+                        // leaving it non-zero relies on every eventfd write producing a
+                        // fresh edge, which is not something we should depend on for
+                        // connection handover. A drained counter makes the next write
+                        // an unambiguous 0 -> 1 transition.
+                        var buf: [8]u8 = undefined;
+                        while (true) {
+                            _ = posix.read(self.event_fd, &buf) catch break;
+                        }
+                        return .{ .signal = {} };
+                    },
                     2 => return .{ .shutdown = {} },
                     else => |nptr| return .{ .recv = @ptrFromInt(nptr) },
                 }
@@ -1623,6 +1751,11 @@ pub fn Conn(comptime WSH: type) type {
         // for thar narrow window.
         processing: bool = false,
 
+        // Set once the websocket read loop has ended and this Conn has been
+        // queued into the worker's ws_close_list. Prevents a second queueing
+        // (and thus a double free) from a later terminal path.
+        closing: bool = false,
+
         const Self = @This();
 
         fn close(self: *Self) void {
@@ -1646,6 +1779,14 @@ pub fn Conn(comptime WSH: type) type {
 
         pub fn releaseProcessing(self: *Self) void {
             return @atomicStore(bool, &self.processing, false, .release);
+        }
+
+        // Returns true for the first caller only. Guarantees that a websocket
+        // connection is queued for teardown exactly once, even if two threads
+        // (a stale event's worker and the current worker) reach a terminal
+        // condition for the same connection.
+        pub fn markClosing(self: *Self) bool {
+            return @atomicRmw(bool, &self.closing, .Xchg, true, .acq_rel) == false;
         }
     };
 }
@@ -2091,4 +2232,99 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
         prev = node.prev;
     }
     try t.expectEqual(0, i);
+}
+
+// Deadlines are not ordered within a list: a connection is appended when its
+// request completes, carrying a deadline computed when it was dispatched. A
+// slow request dispatched early can be appended behind a fast one dispatched
+// later. collectTimedOut must therefore scan the whole list; stopping at the
+// first unexpired entry stranded every expired connection behind it.
+test "collectTimedOut: unordered deadlines" {
+    const W = NonBlocking(void, httpz.DummyWebsocketHandler);
+    const C = Conn(httpz.DummyWebsocketHandler);
+
+    var hc1: HTTPConn = undefined;
+    var hc2: HTTPConn = undefined;
+    var hc3: HTTPConn = undefined;
+
+    // [expired, not expired, expired] - the old scan stopped at c2 and left c3.
+    hc1.timeout = 5;
+    hc2.timeout = 100;
+    hc3.timeout = 7;
+
+    var c1 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc1 } };
+    var c2 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc2 } };
+    var c3 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc3 } };
+
+    var list = List(C){};
+    list.insert(&c1);
+    list.insert(&c2);
+    list.insert(&c3);
+
+    const timed_out, const count, const next_timeout = W.collectTimedOut(&list, 10);
+
+    try t.expectEqual(2, count);
+    try t.expectEqual(100, next_timeout.?);
+
+    // both expired conns were detached, in list order
+    try t.expectEqual(&c1, timed_out.head.?);
+    try t.expectEqual(&c3, timed_out.head.?.next.?);
+    try t.expectEqual(null, timed_out.head.?.next.?.next);
+    try t.expectEqual(&c3, timed_out.tail.?);
+
+    // the survivor is still linked, and no longer points at the detached chain
+    try t.expectEqual(&c2, list.head.?);
+    try t.expectEqual(&c2, list.tail.?);
+    try t.expectEqual(null, c2.next);
+    try t.expectEqual(null, c2.prev);
+}
+
+test "collectTimedOut: nothing expired" {
+    const W = NonBlocking(void, httpz.DummyWebsocketHandler);
+    const C = Conn(httpz.DummyWebsocketHandler);
+
+    var hc1: HTTPConn = undefined;
+    var hc2: HTTPConn = undefined;
+    hc1.timeout = 30;
+    hc2.timeout = 20;
+
+    var c1 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc1 } };
+    var c2 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc2 } };
+
+    var list = List(C){};
+    list.insert(&c1);
+    list.insert(&c2);
+
+    const timed_out, const count, const next_timeout = W.collectTimedOut(&list, 10);
+    try t.expectEqual(0, count);
+    try t.expectEqual(null, timed_out.head);
+    // the earliest deadline in the list, not merely the head's
+    try t.expectEqual(20, next_timeout.?);
+    try t.expectEqual(&c1, list.head.?);
+    try t.expectEqual(&c2, list.tail.?);
+}
+
+test "collectTimedOut: everything expired" {
+    const W = NonBlocking(void, httpz.DummyWebsocketHandler);
+    const C = Conn(httpz.DummyWebsocketHandler);
+
+    var hc1: HTTPConn = undefined;
+    var hc2: HTTPConn = undefined;
+    hc1.timeout = 3;
+    hc2.timeout = 4;
+
+    var c1 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc1 } };
+    var c2 = C{ .next = null, .prev = null, .protocol = .{ .http = &hc2 } };
+
+    var list = List(C){};
+    list.insert(&c1);
+    list.insert(&c2);
+
+    const timed_out, const count, const next_timeout = W.collectTimedOut(&list, 10);
+    try t.expectEqual(2, count);
+    try t.expectEqual(null, next_timeout);
+    try t.expectEqual(null, list.head);
+    try t.expectEqual(null, list.tail);
+    try t.expectEqual(&c1, timed_out.head.?);
+    try t.expectEqual(&c2, timed_out.tail.?);
 }
